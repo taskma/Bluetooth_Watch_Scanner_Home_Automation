@@ -9,3 +9,4 @@
 
 
 ![alt text](https://github.com/taskma/Bluetooth_Watch_Scanner_Home_Automation/blob/master/beacon.jpg)
+![alt text](https://github.com/taskma/Bluetooth_Watch_Scanner_Home_Automation/blob/master/lamp.jpeg)
