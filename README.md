@@ -8,4 +8,4 @@
 * You can decide to anyone is in the room or no and you can open or close lights in the room
 
 
-![alt text](https://github.com/taskma/Bluetooth_Watch_Scanner_Home_Automation/blob/master/beacon.jpg
+![alt text](https://github.com/taskma/Bluetooth_Watch_Scanner_Home_Automation/blob/master/beacon.jpg)
