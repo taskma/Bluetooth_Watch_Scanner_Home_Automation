@@ -3,8 +3,8 @@
 * You can use all of the bluetooth watches
 * All of the bluetooth watches are sending beacon signals like ibeacon
 * This code captures this signals and detect RSSI (The received signal strength)
-* Sends Bluetooth Watch MAC adress and RSSI TO MQTT Server
-* You can read this MQ mesages and detect distance between clock and ESP32 receiver
+* Sends Bluetooth Watch MAC adress and RSSI to MQTT 
+* You can read this MQ mesages and detect distance between watch and ESP32 receiver
 * You can decide to anyone is in the room or no and you can open or close lights in the room
 
 
