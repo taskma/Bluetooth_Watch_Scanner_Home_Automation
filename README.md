@@ -1,6 +1,7 @@
 # ESP32 Bluetooth Watch Scanner → MQTT (Presence / Proximity)
 
-Scans BLE beacons (iBeacon-like), reads RSSI, and publishes {MAC, RSSI} to MQTT.
+Scans BLE beacons (iBeacon-like), reads RSSI, and publishes `{MAC, RSSI}` to MQTT.  
+Useful for simple presence/proximity automation in home setups.
 
 ## Hardware
 - ESP32
@@ -9,27 +10,26 @@ Scans BLE beacons (iBeacon-like), reads RSSI, and publishes {MAC, RSSI} to MQTT.
 
 ## Configure
 Edit `config.h`:
-- Wi-Fi SSID/password
-- MQTT host/port
-- publish topic
+- Wi-Fi SSID / password
+- MQTT host / port
+- Publish topic
 
-## MQTT Payload
+## MQTT payload
 Example:
-topic: home/presence/ble
-payload: {"mac":"AA:BB:CC:DD:EE:FF","rssi":-62}
+- topic: `home/presence/ble`
+- payload: `{"mac":"AA:BB:CC:DD:EE:FF","rssi":-62}`
 
-## Safety / Privacy
+## Safety & privacy
 Do not track people without consent.
 
+---
 
-# Bluetooth Watch Scanner with ESP32 for Home Automation (Beacon Mode)
-
-* You can use all of the bluetooth watches
-* All of the bluetooth watches are sending beacon signals like ibeacon
-* This code captures this signals and detect RSSI (The received signal strength)
-* Sends Bluetooth Watch MAC adress and RSSI to MQTT 
-* You can read this MQ mesages and detect distance between watch and ESP32 receiver
-* You can decide to anyone is in the room or no and you can turn on or turn off the lights in the room
+## Bluetooth Watch Scanner with ESP32 for Home Automation (Beacon Mode)
+- Many Bluetooth watches can broadcast beacon signals (iBeacon-like).
+- This project captures those signals, reads RSSI (received signal strength),
+  and publishes the watch MAC address + RSSI to MQTT.
+- You can consume these MQTT messages to estimate proximity (distance approximation)
+  and trigger automations (e.g., turn lights on/off when someone enters/leaves a room).
 
 
 ![alt text](https://github.com/taskma/Bluetooth_Watch_Scanner_Home_Automation/blob/master/esp32.jpeg)
