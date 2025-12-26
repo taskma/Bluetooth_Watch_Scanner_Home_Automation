@@ -1,360 +1,388 @@
 #include "config.h"
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoOTA.h>
+
 #include <BLEDevice.h>
 #include <BLEUtils.h>
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
-#include <WiFi.h>
-#include <PubSubClient.h>
-#include <ArduinoOTA.h>
-#include <sstream>
+
+/*
+  BLE Watch Scanner → WiFi → MQTT + OTA (ESP32)
 
 
-BLEScan *pBLEScan;
-WiFiClient espClient;
-PubSubClient mqttClient(espClient);
+  Expected config.h (example)
+  --------------------------
+  #define WIFI_SSID      "..."
+  #define WIFI_PASSWORD  "..."
+  #define MQTT_ADDRESS   "192.168.1.10"
+  static const char* hostName = "ble-scanner-1";
+  constexpr uint8_t LedPin = 2;
+  constexpr uint16_t scanTimeSeconds = 5;
 
-const char *ssid = WIFI_SSID;
-const char *password = WIFI_PASSWORD;
-const char *mqtt_server = MQTT_ADDRESS;
+  Notes:
+  - MQTT topics are derived from hostName.
+  - Publish payload size is chunked to avoid exceeding broker/client limits.
+*/
 
-const String mqttThisRequest = hostName +  "/request";
-const String mqttThisResponse = hostName +  "/response";
-const String mqttAllRequest = hostName +  "/getip";
-const String mqttAllResponse = hostName +  "/ip";
+namespace App {
 
-byte wifiCounter = 0;
-byte counter = 0;
-bool isFirstTime = true;
-//
+// -----------------------------
+// Build-time defaults (override in config.h if you want)
+// -----------------------------
+#ifndef MQTT_PORT
+static constexpr uint16_t MQTT_PORT = 1883;
+#endif
 
-//
+static constexpr uint32_t WIFI_RETRY_MS      = 1500;
+static constexpr uint32_t MQTT_RETRY_MS      = 1500;
+static constexpr uint32_t STATUS_PUBLISH_MS  = 60000;
+static constexpr uint32_t BLE_SCAN_GAP_MS    = 2000;  // pause between scans
+static constexpr uint8_t  MQTT_PAYLOAD_CHUNK = 8;     // devices per MQTT message
 
+// If config.h defines these, they take precedence via the symbols:
+#ifndef LedPin
+static constexpr uint8_t LedPin = 2;
+#endif
 
-class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks
-{
-    void onResult(BLEAdvertisedDevice advertisedDevice)
-    {
-        
-    }
-};
+#ifndef scanTimeSeconds
+static constexpr uint16_t scanTimeSeconds = 5;
+#endif
 
-void setup()
-{
-    Serial.begin(115200);
-    delay(10);
-    pinMode(LedPin, OUTPUT);
-    digitalWrite(LedPin, LOW);
-    Serial.println();
+static const char* WIFI_SSID_C = WIFI_SSID;
+static const char* WIFI_PASS_C = WIFI_PASSWORD;
+static const char* MQTT_HOST_C = MQTT_ADDRESS;
 
-    Serial.print("Connecting to network: ");
-    Serial.println(ssid);
-    WiFi.disconnect(true);  //disconnect form wifi to set new wifi connection
-    WiFi.mode(WIFI_STA);    //init wifi mode
-    WiFi.begin(ssid, password); //connect to wifi
-    wifiProccess();
-    Serial.println("");
-    Serial.println("WiFi connected...");
-    Serial.println("IP address set: ");
-    Serial.println(WiFi.localIP()); //print LAN IP
-    digitalWrite(LedPin, HIGH);
-    delay(500);
-    digitalWrite(LedPin, LOW);
+// -----------------------------
+// Globals
+// -----------------------------
+WiFiClient wifiClient;
+PubSubClient mqtt(wifiClient);
+BLEScan* bleScan = nullptr;
 
-    delay(100);
-    mqttClient.setServer(mqtt_server, 1883);
-    mqttClient.setCallback(callbackMQTT);
-    otaProcess();
+// Topics (stable C buffers)
+static char topicRequest[128];
+static char topicResponse[128];
+static char topicGetIpRequest[128];
+static char topicGetIpResponse[128];
 
-    Serial.println("Bluetooth Scanning...");
-    BLEDevice::init("");
-    pBLEScan = BLEDevice::getScan(); //create new scan
-    pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
-    pBLEScan->setActiveScan(true); //active scan uses more power, but get results faster
-    pBLEScan->setInterval(100);
-    pBLEScan->setWindow(99); // less or equal setInterval value
+// Timing state
+static uint32_t lastWiFiAttemptMs = 0;
+static uint32_t lastMqttAttemptMs = 0;
+static uint32_t lastStatusPublishMs = 0;
+static uint32_t lastBleScanMs = 0;
+
+// Small LED helper (active-high assumed)
+static inline void ledOn()  { digitalWrite(LedPin, HIGH); }
+static inline void ledOff() { digitalWrite(LedPin, LOW);  }
+
+static inline bool wifiUp() { return WiFi.status() == WL_CONNECTED; }
+
+// -----------------------------
+// MQTT helpers
+// -----------------------------
+static void mqttPublish(const char* topic, const char* payload, bool retained = false) {
+  if (!mqtt.connected()) return;
+  mqtt.publish(topic, payload, retained);
 }
 
-void loop()
-{
-    wifiProccess();
-    mqttProccess();
-    ArduinoOTA.handle();
-    // put your main code here, to run repeatedly:
-    BLEScanResults foundDevices = pBLEScan->start(scanTime, false);
-    Serial.print("...................Devices found: ");
-    Serial.println(foundDevices.getCount());
+static void publishIp() {
+  if (!wifiUp() || !mqtt.connected()) return;
 
-    sendDevicesJson(foundDevices);
-    printDevices(foundDevices);
-
-    Serial.println("..................Scan done!");
-    pBLEScan->clearResults(); // delete results fromBLEScan buffer to release memory
-    delay(2000);
+  char msg[160];
+  snprintf(msg, sizeof(msg), "%s ==> %s", hostName, WiFi.localIP().toString().c_str());
+  mqttPublish(topicGetIpResponse, msg, false);
 }
 
-void sendDevicesJson(BLEScanResults foundDevices)
-{
-    std::stringstream ss;
-    boolean hasDevice = false;
+static void publishStatus() {
+  // Minimal “alive” ping. Customize as needed.
+  if (!wifiUp() || !mqtt.connected()) return;
 
-    int count = foundDevices.getCount();
-    ss << "[";
-    for (int i = 0; i < count; i++)
-    {
-        if (hasDevice)
-        {
-            ss << ",";
-        }
-        BLEAdvertisedDevice d = foundDevices.getDevice(i);
-        ss << "{\"Address\":\"" << d.getAddress().toString() << "\",\"Rssi\":" << d.getRSSI();
-        ss << "}";
-        hasDevice = true;
-        if ((i + 1) % 2 == 0)
-        {
-            ss << "]";
-            sendThisMqResponse(ss.str().c_str());
-            delay(50);
-            ss.str(std::string());
-            ss << "[";
-            printy("clear sonrasi", ss.str().c_str());
-            hasDevice = false;
-        }
-    }
-    if (hasDevice)
-    {
-        ss << "]";
-        sendThisMqResponse(ss.str().c_str());
-    }
+  char msg[128];
+  snprintf(msg, sizeof(msg), "{\"host\":\"%s\",\"ip\":\"%s\",\"rssi\":%d}",
+           hostName, WiFi.localIP().toString().c_str(), WiFi.RSSI());
+  mqttPublish(topicResponse, msg, true /*retain*/);
 }
 
-void sendThisMqResponse(String msg)
-{
-    printy("mqtt", msg);
-    mqttClient.publish(string2char(mqttThisResponse), string2char(msg));
+static void onMqttMessage(char* topic, byte* payload, unsigned int length) {
+  // Convert payload to small null-terminated buffer safely
+  char msg[128];
+  const unsigned int n = (length >= sizeof(msg)) ? (sizeof(msg) - 1) : length;
+  memcpy(msg, payload, n);
+  msg[n] = '\0';
+
+  const String t(topic);
+  const String v(msg);
+
+  Serial.print("[MQTT] ");
+  Serial.print(t);
+  Serial.print(" => ");
+  Serial.println(v);
+
+  if (t == topicGetIpRequest && v == "showip") {
+    publishIp();
+    return;
+  }
+
+  // You can expand this later:
+  // - topicRequest for runtime config (scanTime, filters, etc.)
+  // - commands like "ping", "status"
 }
 
+// -----------------------------
+// WiFi (non-blocking)
+// -----------------------------
+static void ensureWiFi() {
+  if (wifiUp()) return;
 
+  const uint32_t now = millis();
+  if (now - lastWiFiAttemptMs < WIFI_RETRY_MS) return;
+  lastWiFiAttemptMs = now;
 
-void printDevices(BLEScanResults foundDevices)
-{
-    int count = foundDevices.getCount();
-    for (int i = 0; i < count; i++)
-    {
-        BLEAdvertisedDevice device = foundDevices.getDevice(i);
-        printDevice(device);
-    }
+  static uint8_t tries = 0;
+  if (tries == 0) {
+    Serial.print("[WiFi] Connecting to ");
+    Serial.println(WIFI_SSID_C);
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_STA);
+  }
+  WiFi.begin(WIFI_SSID_C, WIFI_PASS_C);
+
+  tries++;
+  Serial.print("[WiFi] attempt=");
+  Serial.println(tries);
+
+  // Simple visual feedback
+  (tries % 2 == 0) ? ledOn() : ledOff();
+
+  // If you want auto-restart after many failures, add a threshold here.
 }
 
-void printDevice(BLEAdvertisedDevice device)
-{
-    std::stringstream ss;
-    ss << "[";
-    ss << "{\"Address\":\"" << device.getAddress().toString() << "\",\"Rssi\":" << device.getRSSI();
-    std::stringstream sAdress;
-    sAdress << device.getAddress().toString();
-    String adress = sAdress.str().c_str();
+// -----------------------------
+// MQTT (non-blocking)
+// -----------------------------
+static void ensureMqtt() {
+  if (!wifiUp()) return;
+  if (mqtt.connected()) return;
 
-    if (device.haveName())
-    {
-        ss << ",\"Name\":\"" << device.getName() << "\"";
-    }
+  const uint32_t now = millis();
+  if (now - lastMqttAttemptMs < MQTT_RETRY_MS) return;
+  lastMqttAttemptMs = now;
 
-    if (device.haveTXPower())
-    {
-        ss << ",\"TxPower\":" << (int)device.getTXPower();
-    }
-    if (adress.indexOf("e6:7f:58:d7:eb:09") >= 0)
-    {
-        ss << ", ** Yigit mi Band 4 **";
-    }
+  Serial.print("[MQTT] Connecting to ");
+  Serial.println(MQTT_HOST_C);
 
-    if (adress.indexOf("f8:9b:67:e2:9a:2e") >= 0)
-    {
-        ss << ", ** Pu mi Band 4 **";
-    }
+  if (mqtt.connect(hostName)) {
+    Serial.println("[MQTT] Connected");
+    ledOn();
 
-    ss << "}";
-    ss << "]";
-    Serial.println(ss.str().c_str());
+    mqtt.subscribe(topicRequest);
+    mqtt.subscribe(topicGetIpRequest);
+
+    publishStatus();
+    publishIp();
+  } else {
+    Serial.print("[MQTT] Failed rc=");
+    Serial.println(mqtt.state());
+    ledOff();
+  }
 }
 
-void mqttProccess()
-{
-    if (!mqttClient.connected())
-    {
-        if (repeatMqttSec >= 60)
-        {
-            reconnectMQTT();
-        }
-    }
-    else
-    {
-        mqttClient.loop();
-        if (isFirstTime)
-        {
-            isFirstTime = false;
-        }
-    }
-}
+// -----------------------------
+// OTA
+// -----------------------------
+static void setupOta() {
+  ArduinoOTA.setHostname(hostName);
 
-void wifiProccess()
-{
-    if (WiFi.status() == WL_CONNECTED)
-    {
-        wifiCounter = 0; //reset counter
-        Serial.println("Wifi is still connected with IP: ");
-        Serial.println(WiFi.localIP()); //inform user about his IP address
-    }
-    else if (WiFi.status() != WL_CONNECTED)
-    { //if we lost connection, retry
-        WiFi.begin(ssid, password);
-    }
-    while (WiFi.status() != WL_CONNECTED)
-    { //during lost connection, print dots
-        delay(500);
-        Serial.print(".");
-        wifiCounter++;
-        if (wifiCounter >= 60)
-        { //30 seconds timeout - reset board
-            Serial.println("Esp Restarting ...");
-            delay(1000);
-            ESP.restart();
-        }
-    }
-}
+  ArduinoOTA
+      .onStart([]() { Serial.println("[OTA] Start"); })
+      .onEnd([]() { Serial.println("\n[OTA] End"); })
+      .onProgress([](unsigned int progress, unsigned int total) {
+        Serial.printf("[OTA] Progress: %u%%\r", (progress * 100U) / total);
+      })
+      .onError([](ota_error_t error) {
+        Serial.printf("[OTA] Error[%u]: ", error);
+        if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
+        else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
+        else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
+        else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+        else if (error == OTA_END_ERROR) Serial.println("End Failed");
+      });
 
-void reconnectMQTT()
-{
-    Serial.println("reconnectMQTT girdi...");
-    // Loop until we're reconnected
-    while (!mqttClient.connected())
-    {
-        Serial.print("Attempting MQTT connection...");
-        // Attempt to connect
-        // if (mqttClient.connect("BlinkMQTTBridge", mqtt_username, mqtt_password)) {
-        if (mqttClient.connect(string2char(hostName)))
-        {
-            Serial.println("connected");
-            repeatMqttSec = 60;
-            counter = 0;
-            // ... and resubscribe
-            digitalWrite(LedPin, HIGH);
-        }
-        else
-        {
-            Serial.print("failed, rc=");
-            Serial.print(mqttClient.state());
-            Serial.println(" try again in 0.3 second");
-            ++counter;
-            if (counter > 20)
-            {
-                Serial.println(" reseting..........");
-                delay(2000);
-                ESP.restart();
-            }
-            // Wait .3 seconds before retrying
-            delay(300);
-        }
-    }
-}
-
-void callbackMQTT(char *topic, byte *payload, unsigned int length)
-{
-    Serial.println("Message arrived [");
-    //Serial.print(topic);
-    String topicStr = String(topic);
-    String value = "";
-    for (int i = 0; i < length; i++)
-    {
-        char receivedChar = (char)payload[i];
-        value += String(receivedChar);
-    }
-    printy(topicStr, value);
-    if (topicStr == mqttAllRequest)
-    {
-        if (value == "showip")
-        {
-            Serial.println("showip");
-            String messagehostName = hostName + " ==>" + WiFi.localIP().toString();
-            mqttClient.publish(string2char(mqttAllResponse), string2char(messagehostName));
-        }
-    }
-}
-
-char *string2char(String command)
-{
-    if (command.length() != 0)
-    {
-        char *p = const_cast<char *>(command.c_str());
-        //Serial.print("*p ==>");
-        //Serial.print(p);
-        //Serial.println("<==");
-        return p;
-    }
-}
-
-char *string2char(double val)
-{
-    //Serial.print("string2char ==> ");
-    Serial.println(val);
-    char buffer[15];
-    dtostrf(val, 5, 2, buffer);
-    //Serial.print("buffer ==> ");
-    //Serial.println(buffer);
-    String temper = String(buffer);
-    //Serial.print("temper ==>");
-    //Serial.print(temper);
-    //Serial.println("<==");
-    return buffer;
-}
-
-void printy(String p1, String p2)
-{
-    Serial.print(p1);
-    Serial.print(" ==> ");
-    Serial.println(p2);
-}
-
-void printy(String p1, int p2)
-{
-    printy(p1, String(p2));
-}
-
-void printy(String p1, double p2)
-{
-    printy(p1, String(p2));
-}
-
-void printy(String p1, float p2)
-{
-    printy(p1, String(p2));
-}
-
-void otaProcess()
-{
-  //OTA
-  // Port defaults to 8266
-  // ArduinoOTA.setPort(8266);
-  // Hostname defaults to esp8266-[ChipID]
-  ArduinoOTA.setHostname(string2char(hostName));
-  // No authentication by default
-  //ArduinoOTA.setPassword((const char *)"xxx");
-  ArduinoOTA.onStart([]() {
-    Serial.println("Start");
-  });
-  ArduinoOTA.onEnd([]() {
-    Serial.println("\nEnd");
-  });
-  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-    Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
-  });
-  ArduinoOTA.onError([](ota_error_t error) {
-    Serial.printf("Error[%u]: ", error);
-    if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
-    else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
-    else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
-    else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
-    else if (error == OTA_END_ERROR) Serial.println("End Failed");
-  });
   ArduinoOTA.begin();
 }
+
+// -----------------------------
+// BLE scanning
+// -----------------------------
+class ScanCallbacks final : public BLEAdvertisedDeviceCallbacks {
+public:
+  void onResult(BLEAdvertisedDevice advertisedDevice) override {
+    // Optional: You can filter devices here (by address prefix, RSSI threshold, etc.)
+    // Keep empty to collect all results.
+    (void)advertisedDevice;
+  }
+};
+
+static void setupBle() {
+  Serial.println("[BLE] Init + scanning config...");
+  BLEDevice::init("");
+
+  bleScan = BLEDevice::getScan();
+  bleScan->setAdvertisedDeviceCallbacks(new ScanCallbacks(), false);
+  bleScan->setActiveScan(true);  // faster results, more power
+  bleScan->setInterval(100);
+  bleScan->setWindow(99);
+}
+
+static void publishScanResults(const BLEScanResults& results) {
+  if (!mqtt.connected()) return;
+
+  const int count = results.getCount();
+  if (count <= 0) return;
+
+  // Chunk JSON array to avoid oversize MQTT payloads.
+  // Format: [{"Address":"..","Rssi":-65}, ...]
+  String payload;
+  payload.reserve(512);
+
+  uint8_t inChunk = 0;
+  payload = "[";
+
+  for (int i = 0; i < count; i++) {
+    const BLEAdvertisedDevice d = results.getDevice(i);
+
+    if (inChunk > 0) payload += ",";
+    payload += "{\"Address\":\"";
+    payload += d.getAddress().toString().c_str();
+    payload += "\",\"Rssi\":";
+    payload += String(d.getRSSI());
+    payload += "}";
+
+    inChunk++;
+
+    if (inChunk >= MQTT_PAYLOAD_CHUNK) {
+      payload += "]";
+      mqttPublish(topicResponse, payload.c_str(), false);
+      delay(10);  // tiny yield for WiFi stack
+
+      payload = "[";
+      inChunk = 0;
+    }
+  }
+
+  if (inChunk > 0) {
+    payload += "]";
+    mqttPublish(topicResponse, payload.c_str(), false);
+  }
+}
+
+static void logScanResults(const BLEScanResults& results) {
+  const int count = results.getCount();
+  Serial.print("[BLE] Devices found: ");
+  Serial.println(count);
+
+  // Keep logging light; printing everything can be very noisy.
+  // If you want per-device logs, enable it behind a flag.
+  for (int i = 0; i < count; i++) {
+    const BLEAdvertisedDevice d = results.getDevice(i);
+    Serial.print("  - ");
+    Serial.print(d.getAddress().toString().c_str());
+    Serial.print(" rssi=");
+    Serial.print(d.getRSSI());
+
+    if (d.haveName()) {
+      Serial.print(" name=\"");
+      Serial.print(d.getName().c_str());
+      Serial.print("\"");
+    }
+    Serial.println();
+  }
+}
+
+static void maybeScanBle() {
+  const uint32_t now = millis();
+  if (now - lastBleScanMs < (scanTimeSeconds * 1000UL + BLE_SCAN_GAP_MS)) return;
+  lastBleScanMs = now;
+
+  if (!wifiUp()) return;  // scanning is fine without wifi, but publishing needs it
+
+  // NOTE: start() blocks for scanTimeSeconds; OTA/MQTT still works between scans.
+  BLEScanResults results = bleScan->start(scanTimeSeconds, false);
+
+  logScanResults(results);
+  publishScanResults(results);
+
+  bleScan->clearResults();  // important: free memory
+}
+
+// -----------------------------
+// Topic init
+// -----------------------------
+static void buildTopics() {
+  // Keep backward-compatible topic naming from your original sketch.
+  // Feel free to change to global topics like "ble_all/request" later.
+  snprintf(topicRequest, sizeof(topicRequest), "%s/request", hostName);
+  snprintf(topicResponse, sizeof(topicResponse), "%s/response", hostName);
+  snprintf(topicGetIpRequest, sizeof(topicGetIpRequest), "%s/getip", hostName);
+  snprintf(topicGetIpResponse, sizeof(topicGetIpResponse), "%s/ip", hostName);
+
+  Serial.print("[MQTT] topicRequest: ");
+  Serial.println(topicRequest);
+  Serial.print("[MQTT] topicResponse: ");
+  Serial.println(topicResponse);
+  Serial.print("[MQTT] topicGetIpRequest: ");
+  Serial.println(topicGetIpRequest);
+  Serial.print("[MQTT] topicGetIpResponse: ");
+  Serial.println(topicGetIpResponse);
+}
+
+} // namespace App
+
+// -----------------------------
+// Arduino entrypoints
+// -----------------------------
+void setup() {
+  Serial.begin(115200);
+  delay(50);
+
+  pinMode(App::LedPin, OUTPUT);
+  App::ledOff();
+
+  Serial.println();
+  Serial.println("[BOOT] Starting...");
+
+  App::buildTopics();
+
+  App::mqtt.setServer(App::MQTT_HOST_C, App::MQTT_PORT);
+  App::mqtt.setCallback(App::onMqttMessage);
+
+  App::setupOta();
+  App::setupBle();
+
+  Serial.println("[BOOT] Ready.");
+}
+
+void loop() {
+  App::ensureWiFi();
+  App::ensureMqtt();
+
+  if (App::mqtt.connected()) {
+    App::mqtt.loop();
+  }
+
+  ArduinoOTA.handle();
+
+  // Periodic small status publish (optional)
+  const uint32_t now = millis();
+  if (App::wifiUp() && App::mqtt.connected() && (now - App::lastStatusPublishMs) > App::STATUS_PUBLISH_MS) {
+    App::lastStatusPublishMs = now;
+    App::publishStatus();
+  }
+
+  App::maybeScanBle();
+
+  delay(5); // cooperative yield
