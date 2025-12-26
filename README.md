@@ -1,3 +1,27 @@
+# ESP32 Bluetooth Watch Scanner → MQTT (Presence / Proximity)
+
+Scans BLE beacons (iBeacon-like), reads RSSI, and publishes {MAC, RSSI} to MQTT.
+
+## Hardware
+- ESP32
+- BLE beacon source (watch / tag)
+- Wi-Fi + MQTT broker
+
+## Configure
+Edit `config.h`:
+- Wi-Fi SSID/password
+- MQTT host/port
+- publish topic
+
+## MQTT Payload
+Example:
+topic: home/presence/ble
+payload: {"mac":"AA:BB:CC:DD:EE:FF","rssi":-62}
+
+## Safety / Privacy
+Do not track people without consent.
+
+
 # Bluetooth Watch Scanner with ESP32 for Home Automation (Beacon Mode)
 
 * You can use all of the bluetooth watches
